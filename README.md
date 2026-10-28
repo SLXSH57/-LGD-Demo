@@ -1,7 +1,5 @@
 # Kairos Realtime LGD Demo
 
-這是從 [Kairos-LGD-Demo/realtime-demo](https://github.com/SLXSH57/Kairos-LGD-Demo/tree/main/realtime-demo) 複製的獨立 Realtime LGD 語音測試專案。
-
 ## 功能
 - 單一 WebRTC Realtime Session 與麥克風語音輸入
 - `select_speaker` 決定 NPC 發言角色
