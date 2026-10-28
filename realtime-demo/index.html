@@ -1,0 +1,103 @@
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><title>Kairos LGD Realtime</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:system-ui,sans-serif;background:#0d1526;color:#e9effa;max-width:1220px;margin:30px auto;padding:0 20px}button{padding:11px 17px;border:0;border-radius:8px;background:#3478de;color:white;cursor:pointer;margin:5px}button:disabled{opacity:.4}section,.role{background:#18253a;border:1px solid #32425d;border-radius:12px;padding:16px;margin:12px 0}.roles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px}.active{outline:2px solid #75c5ff}#events{height:230px;overflow:auto;font:12px/1.55 monospace;white-space:pre-wrap}input{padding:11px;max-width:550px;width:70%}p{color:#b2c0d7} .layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(290px,1fr);gap:18px;align-items:start}.goals{position:sticky;top:16px}.goal{padding:13px;border:1px solid #344764;border-radius:9px;margin:10px 0}.goal.done{border-color:#24945d;background:#143b31}.goal .light{color:#8d99ae}.goal.done .light{color:#73e6a1}.goal small{display:block;color:#bec9dc;margin-top:4px}.goalEvidence{margin-top:5px;font-size:12px;color:#a4f4c8}.completed{font-weight:700;color:#8af0b3}#submitStatus{padding:12px;line-height:1.6}#goalCount{font-weight:bold}@media(max-width:760px){.layout{grid-template-columns:1fr}.goals{position:static}} </style></head><body>
+<h1>Kairos LGD — Realtime 語音 Demo</h1><p>單一 WebRTC Session｜select_speaker → submit_turn → A 發言 → B 自動接話</p>
+<button id="connect">連線 + 麥克風</button><button id="stop" disabled>斷線</button><button id="cancel" disabled>中斷發言</button><strong id="state">未連線</strong>
+<div class="roles" id="roles"></div><div class="layout"><div class="mainpanel">
+<section><h2>測試輸入</h2><p>可用麥克風提問，或輸入文字測試：例如「Jordan，你認為 AI 評鑑中心應該如何導入？」</p><input id="question" placeholder="輸入問題"><button id="send" disabled>送出文字</button></section>
+<section><h2>對話記錄</h2><div id="transcript"></div></section><section><h2>事件紀錄</h2><div id="events"></div></section></div><aside class="goals"><section><h2>面談目標 <span id="goalCount">0/4</span></h2><p>只依受試者本人的發言及明確證據判定，NPC 回應不計入。</p><div id="goalList"></div><div id="submitStatus" role="status" aria-live="polite">尚未達成全部目標</div><button id="undoSubmit" disabled>取消自動送出</button><button id="resetGoals">重設目標</button></section></aside></div>
+<p>語音由單一 Realtime Session 產生，因此目前所有 NPC 使用同一聲線。正式上線應另行驗證多聲線需求。API Key 僅在後端。</p>
+<script type="module">
+const people=[["jordan","Jordan","策略、ROI、治理、願景"],["curry","Curry","技術、AI、資料、資安"],["irving","Irving","人資、招募、人才、職能、評鑑"],["klay","Klay","營運、流程、成本、訓練"]];
+const $=id=>document.getElementById(id), ids=people.map(p=>p[0]);
+const names=Object.fromEntries(people.map(p=>[p[0],p[1]])), counts=Object.fromEntries(ids.map(id=>[id,0]));
+const cards=$("roles");for(const p of people){const el=document.createElement("div");el.className="role";el.id="role-"+p[0];el.textContent=p[1]+"｜"+p[2];cards.append(el);}
+let pc,channel,mic,audio,closed=true,phase="idle",busy=false,current=null,next=null,depth=0,actions=[],lastResponse=null;
+const goals=[
+{id:"goal_01",title:"釐清現況與問題",criteria:"受試者需向 NPC 具體詢問現況、根本問題或數據；單純提到問題不算。"},
+{id:"goal_02",title:"分析風險與限制",criteria:"受試者需主動追問或指出至少一項具體風險、資源限制或利害關係衝突。"},
+{id:"goal_03",title:"提出具體方案",criteria:"受試者需提出可執行的措施，包含行動內容與實施方式；僅說應該改善不算。"},
+{id:"goal_04",title:"確認分工與下一步",criteria:"受試者需明確確認負責對象、執行步驟或後續追蹤方式。"}
+];
+const completed=new Map(), evidence=new Map();let goalInput="",lastUserText="",awaitingTranscript=false,autoTimer=null,autoSubmitted=false,submissionEvents=[];
+function renderGoals(){const holder=$("goalList");holder.textContent="";for(const g of goals){const done=completed.has(g.id);const div=document.createElement("div");div.className="goal"+(done?" done":"");const title=document.createElement("strong");title.textContent=(done?"🟢":"⚪")+" "+g.title;const desc=document.createElement("small");desc.textContent=g.criteria;div.append(title,desc);if(done){const proof=document.createElement("div");proof.className="goalEvidence";proof.textContent="證據："+(evidence.get(g.id)||"");div.append(proof);}holder.append(div);}const n=completed.size;$("goalCount").textContent=n+"/"+goals.length;if(n===goals.length&&!autoSubmitted&&!autoTimer)startAutoSubmit();}
+function startAutoSubmit(){log("全部面談目標完成，準備自動送出");$("submitStatus").className="completed";let seconds=4;$("submitStatus").textContent="全部目標完成！"+seconds+" 秒後自動送出。";$("undoSubmit").disabled=false;autoTimer=setInterval(()=>{seconds--;if(seconds>0){$("submitStatus").textContent="全部目標完成！"+seconds+" 秒後自動送出。";return;}clearInterval(autoTimer);autoTimer=null;$("undoSubmit").disabled=true;autoSubmitted=true;const result={event:"interview_auto_submitted",timestamp:new Date().toISOString(),goals:goals.map(g=>({id:g.id,title:g.title,completed:completed.has(g.id),evidence:evidence.get(g.id)||""}))};submissionEvents.push(result);log("AUTO_SUBMIT "+JSON.stringify(result));$("submitStatus").textContent="已自動提交本次面談結果（本地事件）。";window.dispatchEvent(new CustomEvent("kairos:interview-submitted",{detail:result}));},1000);}
+function cancelAuto(){if(autoTimer){clearInterval(autoTimer);autoTimer=null;$("undoSubmit").disabled=true;$("submitStatus").textContent="已取消自動送出，全部目標仍為完成狀態。";log("受試者取消自動送出");}}
+$("undoSubmit").onclick=cancelAuto;
+$("resetGoals").onclick=()=>{cancelAuto();completed.clear();evidence.clear();autoSubmitted=false;lastUserText="";renderGoals();$("submitStatus").textContent="尚未達成全部目標";log("目標狀態已重設");};
+renderGoals();
+function log(message){const div=document.createElement("div");div.textContent=new Date().toLocaleTimeString()+" "+message;$("events").append(div);$("events").scrollTop=$("events").scrollHeight;}
+function turn(who,value){const div=document.createElement("p");const name=document.createElement("b");name.textContent=who+"：";div.append(name,document.createTextNode(value));$("transcript").prepend(div);}
+function focus(id){for(const p of people)$("role-"+p[0]).classList.toggle("active",p[0]===id);}
+function send(event){if(channel?.readyState==="open")channel.send(JSON.stringify(event));}
+function restart(){phase="idle";busy=false;current=null;next=null;depth=0;actions=[];focus(null);}
+const evaluation={type:"function",name:"evaluate_interview_goals",description:"只根據本回合受試者自己的話判定面談目標。不能把 NPC 的話算入；需要直接、具體的證據，不確定則 completed=false；每項任務提供 evidence。",parameters:{type:"object",properties:{results:{type:"array",items:{type:"object",properties:{goal_id:{type:"string",enum:goals.map(g=>g.id)},completed:{type:"boolean"},evidence:{type:"string"}},required:["goal_id","completed","evidence"],additionalProperties:false}}},required:["results"],additionalProperties:false}};
+function assess(text){if(!text||closed||busy||autoSubmitted)return;goalInput=text;phase="assess";create("你現在是面談任務嚴格評分員，只呼叫 evaluate_interview_goals，不要說話。只評估這句受試者發言（不是 NPC）："+JSON.stringify(text)+"。目標及達成條件："+JSON.stringify(goals)+ "。必須有具體證據才能 completed=true，不能推測未說出的行為。","required");}
+const selection={type:"function",name:"select_speaker",description:"依明確點名 > 專業詞 > 代名詞 > 純開放題。開放題選發言次數最少者，避免永遠延續上一位。只回傳角色代號。",parameters:{type:"object",properties:{speaker_id:{type:"string",enum:ids},reason:{type:"string"}},required:["speaker_id","reason"],additionalProperties:false}};
+const submission={type:"function",name:"submit_turn",description:"提交目前角色的自然繁體中文回覆。只有當 reply 明確向另一位 NPC 提問時才設定 next_speaker_id；否則 null。B 接話後一律 null。",parameters:{type:"object",properties:{speaker_id:{type:"string",enum:ids},reply:{type:"string"},next_speaker_id:{type:["string","null"],enum:[...ids,null]}},required:["speaker_id","reply","next_speaker_id"],additionalProperties:false}};
+const guide="你是 Kairos LGD 的角色調度器。四位主管："+people.map(p=>p[1]+"("+p[0]+")負責"+p[2]).join("；")+"。對話自然簡短，不唸工具名稱。發言控制：使用 select_speaker 選人，使用 submit_turn 提交台詞。";
+function create(prompt,tool="required"){
+ if(closed||busy)return;busy=true;
+ send({type:"response.create",response:{tool_choice:tool,instructions:prompt}});
+}
+function select(){if(phase!=="idle"||busy)return;depth=0;phase="select";create(guide+"只呼叫 select_speaker。發言次數："+JSON.stringify(counts));}
+function submit(id,followup=false){if(!ids.includes(id)){restart();return;}current=id;phase="submit";focus(id);create(guide+"只呼叫 submit_turn。speaker_id 必須是 "+id+"。"+(followup?"你正在回答上一位 NPC 明確提出的問題，不要再向第三人提問，next_speaker_id 必須為 null。":"回答受試者的問題，若要向某位 NPC 詢問請在 reply 裡明確叫出名字及問句，否則 next_speaker_id=null。")+" 回答 2 至 4 句。");}
+function speak(id,reply,follow){phase="speak";next=follow;counts[id]++;turn(names[id],reply);create("只用繁體中文自然朗讀以下台詞，不得增加文字，不呼叫工具。角色："+names[id]+"。台詞："+reply,"none");}
+function output(call,data){send({type:"conversation.item.create",item:{type:"function_call_output",call_id:call.call_id,output:JSON.stringify(data)}});}
+function handle(call){
+ let a={};try{a=JSON.parse(call.arguments||"{}");}catch{log("工具參數 JSON 格式錯誤");restart();return;}
+ if(call.name==="evaluate_interview_goals"&&phase==="assess"){
+  for(const result of (Array.isArray(a.results)?a.results:[])){if(result.completed!==true||!goals.some(g=>g.id===result.goal_id)||completed.has(result.goal_id))continue;const proof=String(result.evidence||"").trim();if(proof.length<5||!goalInput.includes(proof))continue;completed.set(result.goal_id,true);evidence.set(result.goal_id,proof.slice(0,220));log("任務完成 "+result.goal_id+" / "+proof);}
+  output(call,{accepted:true,completed_goal_ids:[...completed.keys()]});renderGoals();
+  const finished=completed.size===goals.length;
+  actions.push(()=>{if(finished){restart();}else{phase="idle";busy=false;select();}});return;
+ }
+ if(call.name==="select_speaker"&&phase==="select"){
+ const id=ids.includes(a.speaker_id)?a.speaker_id:ids[0];output(call,{accepted:true,speaker_id:id});log("select_speaker → "+id+" / "+(a.reason||""));actions.push(()=>submit(id));return;
+ }
+ if(call.name==="submit_turn"&&phase==="submit"){
+ const id=current,reply=String(a.reply||"").trim().slice(0,1200);let follow=a.next_speaker_id;
+ if(!ids.includes(follow)||follow===id||depth>0||!reply.includes(names[follow])||!/[？?]/.test(reply))follow=null;
+ output(call,{accepted:true,speaker_id:id,next_speaker_id:follow});log("submit_turn → "+id+" / next="+follow);
+ actions.push(()=>reply?speak(id,reply,follow):restart());return;
+ }
+ output(call,{accepted:false,error:"unexpected call"});log("非預期 Function："+call.name);
+}
+function event(e){
+ if(e.type==="session.updated"){$("state").textContent="已連線";log("Session 已設定");}
+ if(e.type==="input_audio_buffer.speech_started"&&phase==="speak"){log("受試者插話，取消接話");next=null;send({type:"response.cancel"});restart();}
+ if(e.type==="conversation.item.input_audio_transcription.completed"){const t=String(e.transcript||"").trim();turn("受試者",t);awaitingTranscript=false;if(phase==="idle"&&!busy)assess(t);else log("受試者轉錄在 NPC 回合中到達，請重新提問");}
+ if(e.type==="input_audio_buffer.committed"){awaitingTranscript=true;log("語音已提交，等待轉錄完成後先做目標判定");}
+ if(e.type==="response.done"){
+ busy=false;const r=e.response||{};if(r.status!=="completed"){log("回覆狀態："+r.status);restart();return;}
+ const calls=(r.output||[]).filter(x=>x.type==="function_call");
+ if(calls.length){for(const c of calls)handle(c);const action=actions.shift();if(action)action();}
+ else if(phase==="speak"){if(next&&depth===0){const target=next;next=null;depth=1;log("A 語音結束，安排 B："+target);submit(target,true);}else{log("回合結束");restart();}}
+ else if(phase==="select"||phase==="submit"||phase==="assess"){log("模型未呼叫預期 Function");restart();}
+ }
+ if(e.type==="error")log("API 錯誤："+JSON.stringify(e.error||e));
+}
+$("connect").onclick=async()=>{
+ if(!closed)return;closed=false;$("connect").disabled=true;$("state").textContent="連線中";
+ try{
+ mic=await navigator.mediaDevices.getUserMedia({audio:true});
+ pc=new RTCPeerConnection();audio=document.createElement("audio");audio.autoplay=true;
+ pc.ontrack=e=>{audio.srcObject=e.streams[0];audio.play().catch(()=>log("請允許播放音訊"));};
+ mic.getTracks().forEach(t=>pc.addTrack(t,mic));
+ channel=pc.createDataChannel("oai-events");
+ channel.onmessage=msg=>{try{event(JSON.parse(msg.data))}catch(e){log(e.message)}};
+ channel.onopen=()=>{
+ send({type:"session.update",session:{instructions:guide,tools:[evaluation,selection,submission],tool_choice:"auto",audio:{input:{turn_detection:{type:"server_vad",create_response:false,interrupt_response:false},transcription:{model:"gpt-4o-mini-transcribe"}}}}});
+ $("send").disabled=false;$("cancel").disabled=false;};
+ const offer=await pc.createOffer();await pc.setLocalDescription(offer);
+ const res=await fetch("/session",{method:"POST",headers:{"Content-Type":"application/sdp"},body:offer.sdp});
+ if(!res.ok)throw new Error(await res.text());
+ await pc.setRemoteDescription({type:"answer",sdp:await res.text()});
+ $("stop").disabled=false;
+ }catch(e){log("連線失敗："+e.message);disconnect();}
+};
+function disconnect(){closed=true;channel?.close();pc?.close();mic?.getTracks().forEach(t=>t.stop());if(audio)audio.srcObject=null;restart();$("connect").disabled=false;$("stop").disabled=true;$("send").disabled=true;$("cancel").disabled=true;$("state").textContent="未連線";}
+$("stop").onclick=disconnect;
+$("cancel").onclick=()=>{send({type:"response.cancel"});next=null;restart();log("取消目前 NPC 回合");};
+$("send").onclick=()=>{const q=$("question").value.trim();if(!q||busy||phase!=="idle")return;send({type:"conversation.item.create",item:{type:"message",role:"user",content:[{type:"input_text",text:q}]}});turn("受試者",q);$("question").value="";assess(q);};
+$("question").onkeydown=e=>{if(e.key==="Enter")$("send").click();};
+</script></body></html>
